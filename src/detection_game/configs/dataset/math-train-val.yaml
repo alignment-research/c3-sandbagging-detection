@@ -1,0 +1,6 @@
+# @package _global_
+# MATH dataset variant using dev split
+defaults:
+  - math
+
+custom_split: dev

@@ -1,0 +1,37 @@
+# @package _global_
+defaults:
+  - _self_
+  - override hydra/hydra_logging: disabled
+  - override hydra/job_logging: disabled
+
+# Dataset builder configuration
+dataset_builder:
+  # Dataset filtering
+  dataset_filter: gpqa  # Options: math, gpqa, bigcodebench, wmdp-bio, etc.
+  
+  # Input directory containing evaluation logs
+  log_dir: logs/runs/all_system_prompts_sweep_2025-08-11_19-25-05
+  
+  # Window configuration for sandbagging model selection
+  window_size: 10  # Size of the window as percentage of total models
+  window_index: 0  # Which window to select (0-based index), or null if selection_mode='all'
+  
+  # Selection mode for sandbagging models
+  # Options: all, smallest_displacement, lowest_accuracy, highest_accuracy
+  selection_mode: highest_accuracy
+  
+  # Balanced dataset parameters
+  max_samples_per_class: 100  # Maximum samples per class for balancing
+  use_analysis: true  # Enable analysis-based selection
+  
+  # Output configuration
+  output_path: null  # Path to save the dataset (null means don't save)
+  output_format: markdown_xml  # Output format: text, json, xml, markdown, markdown_xml
+  
+  # Random seed for reproducibility
+  seed: 42
+
+# Hydra configuration
+hydra:
+  run:
+    dir: .

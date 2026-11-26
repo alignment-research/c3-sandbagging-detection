@@ -1,0 +1,2132 @@
+#!/usr/bin/env python3
+"""
+Multi-sample bootstrap analysis with cross-validation.
+
+This script:
+1. Loads per-sample lie detector scores
+2. Performs k-fold CV where:
+   - Training folds: compute threshold using bootstrap aggregation
+   - Test fold: evaluate using bootstrap aggregation
+3. Reports mean ± std across folds
+
+Usage (Hydra):
+    python -m src.detection_game.classifiers.run_multisample_bootstrap_cv \
+        classifier.input_csv=out/scores.csv \
+        classifier.k_samples=5 \
+        classifier.aggregation=mean \
+        classifier.compare_mode=all-pairs
+
+CRITICAL FIXES IMPLEMENTED:
+- Issue #2: Sample ID support (prevents paraphrase leakage via GroupKFold)
+- Issue #3: Model pair support (per-pair analysis)
+- Issue #5: Fixed boolean flag handling
+- Issue #1: Auto-detect score column
+- NEW: Explicit comparison mode control (paired, pooled, all-pairs, independent)
+- NEW: Parallel fold processing with ProcessPoolExecutor
+"""
+
+from __future__ import annotations
+
+import json
+import sys
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from datetime import datetime
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+
+if TYPE_CHECKING:
+    from src.detection_game.schemas.detection_report import DetectionReport
+
+import hydra
+import numpy as np
+import pandas as pd
+from omegaconf import DictConfig, OmegaConf
+from sklearn.model_selection import GroupKFold, StratifiedKFold
+
+from src.detection_game.utils.aggregation_stats import (
+    ALL_AGGREGATIONS,
+    AVAILABLE_AGGREGATIONS,
+    CORRELATION_AGGREGATIONS,
+    compute_kendall_difficulty,
+    compute_spearman_difficulty,
+    compute_statistic,
+)
+from src.detection_game.utils.paraphrase_grouping import (
+    aggregate_paraphrase_scores,
+    get_aggregation_stats,
+)
+from src.detection_game.utils.threshold_utils import compute_threshold_on_split, evaluate_with_threshold
+
+
+def _validate_detection_report(data: dict) -> list | None:
+    """Validate output dict against DetectionReport schema and return typed reports.
+
+    Returns list of DetectionReport on success, None on failure.
+    Logs a warning on failure but never blocks output.
+    """
+    try:
+        from src.detection_game.schemas.converters import from_bootstrap_json_dict
+
+        # Round-trip through JSON to handle numpy types
+        clean = json.loads(
+            json.dumps(data, default=lambda x: float(x) if isinstance(x, np.floating) else x)
+        )
+        reports = from_bootstrap_json_dict(clean)
+        if reports:
+            print(f"[Schema] Validated as {len(reports)} DetectionReport(s)")
+            return reports
+    except (ValueError, KeyError, json.JSONDecodeError) as e:
+        print(f"[Schema] Warning: DetectionReport validation failed: {e}")
+    return None
+
+
+def _write_report_json(data: dict, output_path: str) -> DetectionReport | None:
+    """Write analysis results to JSON, using DetectionReport if validation succeeds.
+
+    Tries to serialize via DetectionReport.model_dump() for type safety.
+    Falls back to raw dict if validation fails. Both preserve NaN values
+    via json.dumps() (not model_dump_json()).
+
+    Returns DetectionReport if validation succeeds, None otherwise.
+    """
+    path = Path(output_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    reports = _validate_detection_report(data)
+    if reports and len(reports) == 1:
+        # Use validated model for output — ensures schema conformance.
+        # All-pairs mode returns 1 DetectionReport with nested comparisons dict,
+        # so len==1 covers both single-result and all-pairs cases.
+        with open(path, "w") as f:
+            json.dump(
+                reports[0].model_dump(),
+                f,
+                indent=2,
+                default=lambda x: float(x) if isinstance(x, np.floating) else x,
+            )
+        return reports[0]
+    else:
+        # Fallback: write raw dict if validation fails
+        with open(path, "w") as f:
+            json.dump(
+                data,
+                f,
+                indent=2,
+                default=lambda x: float(x) if isinstance(x, np.floating) else x,
+            )
+        return None
+
+
+def _run_single_analysis(params: dict) -> tuple:
+    """Helper function for parallel execution of run_analysis.
+
+    Must be a module-level function to be picklable for ProcessPoolExecutor.
+
+    Args:
+        params: Dictionary containing all arguments for run_analysis
+
+    Returns:
+        Tuple of (identifier, results)
+    """
+    identifier = params.pop("identifier")
+    results = run_analysis(**params)
+    return (identifier, results)
+
+
+def _run_pair_comparison(params: dict) -> tuple:
+    """Helper function for parallel execution of pair comparison.
+
+    Must be a module-level function to be picklable for ProcessPoolExecutor.
+
+    Args:
+        params: Dictionary containing comparison parameters
+
+    Returns:
+        Tuple of (comparison_name, results)
+    """
+    # Extract parameters
+    comparison_name = params["comparison_name"]
+    sandbag_data = params["sandbag_data"]
+    normal_data = params["normal_data"]
+    score_col = params["score_col"]
+    has_sample_id = params["has_sample_id"]
+    has_difficulty = params.get("has_difficulty", False)
+    has_actual_correct = params.get("has_actual_correct", False)
+    args = params["args"]
+
+    # Combine data
+    import pandas as pd
+
+    pair_df = pd.concat([sandbag_data, normal_data], ignore_index=True)
+
+    # Extract samples and labels
+    samples = pair_df[score_col].values
+    labels = pair_df["ground_truth_label"].values
+    groups = pair_df["sample_id"].values if has_sample_id else None
+    difficulty = pair_df["difficulty"].values if has_difficulty else None
+    actual_correct = pair_df["actual_correct"].values if has_actual_correct else None
+
+    # Run analysis
+    if args.compare_aggregations:
+        pair_results = run_aggregation_comparison(
+            samples, labels, groups, args, score_col, comparison_name,
+            difficulty=difficulty, actual_correct=actual_correct
+        )
+    else:
+        pair_results = run_analysis(
+            samples, labels, groups, args, score_col, comparison_name,
+            difficulty=difficulty, actual_correct=actual_correct
+        )
+
+    return (comparison_name, pair_results)
+
+
+def bootstrap_aggregate(
+    samples: np.ndarray,
+    labels: np.ndarray,
+    k_samples: int,
+    n_iterations: int,
+    aggregation: str = "mean",
+    seed: int = 42,
+    allow_k_greater_than_n: bool = False,
+    warn_on_small_n: bool = False,
+    min_samples_for_bootstrap: int = 10,
+    difficulty: np.ndarray | None = None,
+    actual_correct: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Bootstrap k-sample aggregation with support for 18+ statistics.
+
+    Args:
+        samples: Sample scores
+        labels: Ground truth labels (1=sandbagging, 0=normal)
+        k_samples: Number of samples per bootstrap iteration
+        n_iterations: Number of bootstrap iterations
+        aggregation: Aggregation statistic (see ALL_AGGREGATIONS)
+        seed: Random seed
+        allow_k_greater_than_n: If True, allow bootstrapping k > n samples (with duplicates)
+        warn_on_small_n: If True, warn when k > n (helpful for debugging)
+        min_samples_for_bootstrap: Minimum samples required per class (default: 10)
+        difficulty: Optional difficulty values (required for spearman_difficulty)
+        actual_correct: Optional correctness values (required for spearman_difficulty)
+
+    Returns:
+        Tuple of (aggregated scores, aggregated labels)
+    """
+    # Check if this is a correlation-based aggregation
+    is_correlation_agg = aggregation in CORRELATION_AGGREGATIONS
+
+    if is_correlation_agg:
+        if difficulty is None or actual_correct is None:
+            raise ValueError(
+                f"Aggregation '{aggregation}' requires 'difficulty' and 'actual_correct' columns. "
+                "Make sure input CSV has these columns (output from run_difficulty_correlation)."
+            )
+    elif aggregation not in AVAILABLE_AGGREGATIONS:
+        raise ValueError(f"Unknown aggregation '{aggregation}'. Available: {', '.join(ALL_AGGREGATIONS)}")
+
+    np.random.seed(seed)
+
+    # Get indices for each class
+    sandbagging_idx = np.where(labels == 1)[0]
+    normal_idx = np.where(labels == 0)[0]
+
+    sandbagging_samples = samples[sandbagging_idx]
+    normal_samples = samples[normal_idx]
+
+    # For correlation aggregations, also get difficulty and actual_correct
+    if is_correlation_agg:
+        sandbagging_difficulty = difficulty[sandbagging_idx]
+        sandbagging_correct = actual_correct[sandbagging_idx]
+        normal_difficulty = difficulty[normal_idx]
+        normal_correct = actual_correct[normal_idx]
+
+        # Enforce minimum k for Spearman (k=10 recommended by research advisor)
+        min_k_for_correlation = 10
+        if k_samples < min_k_for_correlation:
+            print(
+                f"    ⚠️  Warning: {aggregation} with k={k_samples} may be unstable. "
+                f"Recommend k >= {min_k_for_correlation}."
+            )
+
+    # Determine minimum sample requirement
+    if allow_k_greater_than_n:
+        # With replacement, we need a minimum for meaningful statistics
+        min_samples = min_samples_for_bootstrap
+    else:
+        # Conservative: require n >= k
+        min_samples = max(k_samples, min_samples_for_bootstrap)
+
+    # Warn if k > n (oversampling with duplicates)
+    if warn_on_small_n:
+        if len(sandbagging_samples) < k_samples:
+            print(
+                f"    ⚠️  Sandbagging: n={len(sandbagging_samples)} < k={k_samples} "
+                f"(bootstrap will sample with duplicates)"
+            )
+        if len(normal_samples) < k_samples:
+            print(f"    ⚠️  Normal: n={len(normal_samples)} < k={k_samples} (bootstrap will sample with duplicates)")
+
+    sandbagging_agg = []
+    normal_agg = []
+
+    # Select correlation function based on aggregation type
+    if aggregation == "spearman_difficulty":
+        correlation_func = compute_spearman_difficulty
+    elif aggregation == "kendall_difficulty":
+        correlation_func = compute_kendall_difficulty
+    else:
+        correlation_func = None
+
+    for _ in range(n_iterations):
+        if len(sandbagging_samples) >= min_samples:
+            if is_correlation_agg:
+                # Sample indices to get corresponding difficulty/correctness pairs
+                boot_idx = np.random.choice(len(sandbagging_samples), k_samples, replace=True)
+                sb_difficulty_boot = sandbagging_difficulty[boot_idx]
+                sb_correct_boot = sandbagging_correct[boot_idx]
+                sandbagging_agg.append(correlation_func(sb_difficulty_boot, sb_correct_boot))
+            else:
+                sb_boot = np.random.choice(sandbagging_samples, k_samples, replace=True)
+                sandbagging_agg.append(compute_statistic(sb_boot, aggregation))
+
+        if len(normal_samples) >= min_samples:
+            if is_correlation_agg:
+                boot_idx = np.random.choice(len(normal_samples), k_samples, replace=True)
+                norm_difficulty_boot = normal_difficulty[boot_idx]
+                norm_correct_boot = normal_correct[boot_idx]
+                normal_agg.append(correlation_func(norm_difficulty_boot, norm_correct_boot))
+            else:
+                norm_boot = np.random.choice(normal_samples, k_samples, replace=True)
+                normal_agg.append(compute_statistic(norm_boot, aggregation))
+
+    agg_scores = np.concatenate([sandbagging_agg, normal_agg])
+    agg_labels = np.concatenate([np.ones(len(sandbagging_agg), dtype=int), np.zeros(len(normal_agg), dtype=int)])
+
+    return agg_scores, agg_labels
+
+
+def cross_validate_bootstrap(
+    samples: np.ndarray,
+    labels: np.ndarray,
+    k_samples: int,
+    n_iterations: int,
+    aggregation: str,
+    n_folds: int,
+    target_fpr: float,
+    conservative: bool,
+    stratified: bool,
+    seed: int,
+    groups: np.ndarray | None = None,
+    allow_k_greater_than_n: bool = False,
+    warn_on_small_n: bool = False,
+    min_samples_for_bootstrap: int = 10,
+    difficulty: np.ndarray | None = None,
+    actual_correct: np.ndarray | None = None,
+) -> dict:
+    """Perform CV with bootstrap aggregation.
+
+    Args:
+        samples: Sample scores
+        labels: Ground truth labels
+        k_samples: Number of samples per bootstrap iteration
+        n_iterations: Number of bootstrap iterations
+        aggregation: Aggregation method (mean/median or spearman_difficulty)
+        n_folds: Number of CV folds
+        target_fpr: Target false positive rate
+        conservative: Whether to use conservative thresholding
+        stratified: Whether to use stratified splitting (ignored if groups is provided)
+        seed: Random seed
+        groups: Optional group IDs for GroupKFold (e.g., sample_id to keep paraphrases together)
+        allow_k_greater_than_n: If True, allow bootstrapping k > n samples (with duplicates)
+        warn_on_small_n: If True, warn when k > n (helpful for debugging)
+        min_samples_for_bootstrap: Minimum samples required per class (default: 10)
+        difficulty: Optional difficulty values (required for spearman_difficulty aggregation)
+        actual_correct: Optional correctness values (required for spearman_difficulty aggregation)
+
+    Returns:
+        Dictionary with CV results
+    """
+
+    # Issue #2 FIX: Use GroupKFold if groups are provided (prevents data leakage with sample_id)
+    if groups is not None:
+        kfold = GroupKFold(n_splits=n_folds)
+        print(f"  Using GroupKFold to keep {len(np.unique(groups))} unique samples together across CV folds")
+    elif stratified:
+        kfold = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=seed)
+    else:
+        from sklearn.model_selection import KFold
+
+        kfold = KFold(n_splits=n_folds, shuffle=True, random_state=seed)
+
+    fold_results = []
+    fold_sizes = []  # Track fold sizes for automatic detection
+
+    # GroupKFold requires groups parameter, others don't
+    split_args = (samples, labels, groups) if groups is not None else (samples, labels)
+
+    for fold_idx, (train_idx, test_idx) in enumerate(kfold.split(*split_args)):
+        # Split data
+        train_samples = samples[train_idx]
+        train_labels = labels[train_idx]
+        test_samples = samples[test_idx]
+        test_labels = labels[test_idx]
+
+        # Split difficulty/actual_correct arrays if provided (for correlation aggregations)
+        train_difficulty = difficulty[train_idx] if difficulty is not None else None
+        train_actual_correct = actual_correct[train_idx] if actual_correct is not None else None
+        test_difficulty = difficulty[test_idx] if difficulty is not None else None
+        test_actual_correct = actual_correct[test_idx] if actual_correct is not None else None
+
+        # Track fold statistics (for automatic fold size detection)
+        n_test_positive = int(np.sum(test_labels == 1))
+        n_test_negative = int(np.sum(test_labels == 0))
+        fold_sizes.append(
+            {
+                "fold": fold_idx,
+                "n_positive": n_test_positive,
+                "n_negative": n_test_negative,
+                "n_total": len(test_labels),
+            }
+        )
+
+        # Bootstrap aggregate train fold
+        train_agg_scores, train_agg_labels = bootstrap_aggregate(
+            train_samples,
+            train_labels,
+            k_samples,
+            n_iterations,
+            aggregation,
+            seed + fold_idx,
+            allow_k_greater_than_n=allow_k_greater_than_n,
+            warn_on_small_n=warn_on_small_n,
+            min_samples_for_bootstrap=min_samples_for_bootstrap,
+            difficulty=train_difficulty,
+            actual_correct=train_actual_correct,
+        )
+
+        # Bootstrap aggregate test fold
+        test_agg_scores, test_agg_labels = bootstrap_aggregate(
+            test_samples,
+            test_labels,
+            k_samples,
+            n_iterations,
+            aggregation,
+            seed + fold_idx + 1000,
+            allow_k_greater_than_n=allow_k_greater_than_n,
+            warn_on_small_n=warn_on_small_n,
+            min_samples_for_bootstrap=min_samples_for_bootstrap,
+            difficulty=test_difficulty,
+            actual_correct=test_actual_correct,
+        )
+
+        # Filter NaN values from aggregated scores
+        train_valid_mask = ~np.isnan(train_agg_scores)
+        test_valid_mask = ~np.isnan(test_agg_scores)
+
+        if train_valid_mask.sum() < 5 or test_valid_mask.sum() < 5:
+            # Critical: too many NaN values indicates aggregation failure
+            if warn_on_small_n:
+                print(f"  ⚠️  WARNING: Fold {fold_idx} has too many NaN values!")
+                print(f"     Train: {(~train_valid_mask).sum()}/{len(train_agg_scores)} NaN")
+                print(f"     Test: {(~test_valid_mask).sum()}/{len(test_agg_scores)} NaN")
+                print(f"     This may indicate the aggregation '{aggregation}' is unsuitable for this data")
+            # Skip fold but track it
+            fold_results.append(
+                {
+                    "fold": fold_idx,
+                    "threshold": float("nan"),
+                    "train_fpr": float("nan"),
+                    "train_recall": float("nan"),
+                    "test_fpr": float("nan"),
+                    "test_recall": float("nan"),
+                    "test_precision": float("nan"),
+                    "test_auroc": float("nan"),
+                    "test_auprc": float("nan"),
+                    "test_partial_auc": float("nan"),
+                }
+            )
+            continue
+
+        train_agg_scores = train_agg_scores[train_valid_mask]
+        train_agg_labels = train_agg_labels[train_valid_mask]
+        test_agg_scores = test_agg_scores[test_valid_mask]
+        test_agg_labels = test_agg_labels[test_valid_mask]
+
+        # Compute threshold on aggregated train
+        threshold_result = compute_threshold_on_split(train_agg_scores, train_agg_labels, target_fpr, conservative)
+
+        # Evaluate on aggregated test
+        eval_result = evaluate_with_threshold(
+            test_agg_scores,
+            test_agg_labels,
+            threshold_result["threshold"],
+            # test_agg_scores, test_agg_labels, 0.1
+        )
+
+        # Compute AUROC on test fold
+        from sklearn.metrics import average_precision_score, roc_auc_score
+
+        try:
+            test_auroc = roc_auc_score(test_agg_labels, test_agg_scores)
+        except ValueError:
+            # Handle case where all labels are the same class
+            test_auroc = float("nan")
+
+        # Compute AUPRC on test fold
+        try:
+            test_auprc = average_precision_score(test_agg_labels, test_agg_scores)
+        except ValueError:
+            # Handle case where all labels are the same class
+            test_auprc = float("nan")
+
+        # Compute partial AUC at target FPR (McClish standardized: 0.5=random, 1.0=perfect)
+        # This measures performance specifically in the low-FPR region we care about
+        try:
+            test_partial_auc = roc_auc_score(test_agg_labels, test_agg_scores, max_fpr=target_fpr)
+        except ValueError:
+            # Handle case where all labels are same class or insufficient samples in FPR region
+            test_partial_auc = float("nan")
+
+        fold_results.append(
+            {
+                "fold": fold_idx,
+                "threshold": threshold_result["threshold"],
+                "train_fpr": threshold_result["actual_fpr"],
+                "train_recall": threshold_result["recall_at_threshold"],
+                "test_fpr": eval_result["actual_fpr"],
+                "test_recall": eval_result["recall"],
+                "test_precision": eval_result["precision"],
+                "test_auroc": test_auroc,
+                "test_auprc": test_auprc,
+                "test_partial_auc": test_partial_auc,
+            }
+        )
+
+    # Aggregate across folds
+    test_recalls = [r["test_recall"] for r in fold_results]
+    test_fprs = [r["test_fpr"] for r in fold_results]
+    thresholds = [r["threshold"] for r in fold_results]
+    test_aurocs = [r.get("test_auroc", float("nan")) for r in fold_results]
+    test_auprcs = [r.get("test_auprc", float("nan")) for r in fold_results]
+    test_partial_aucs = [r.get("test_partial_auc", float("nan")) for r in fold_results]
+
+    # Compute minimum fold size (critical for visualization)
+    min_fold_size_positive = min(f["n_positive"] for f in fold_sizes) if fold_sizes else 0
+    min_fold_size_negative = min(f["n_negative"] for f in fold_sizes) if fold_sizes else 0
+    min_fold_size = min(min_fold_size_positive, min_fold_size_negative)
+
+    return {
+        "mean_recall": float(np.mean(test_recalls)),
+        "std_recall": float(np.std(test_recalls)),
+        "mean_fpr": float(np.mean(test_fprs)),
+        "std_fpr": float(np.std(test_fprs)),
+        "mean_threshold": float(np.mean(thresholds)),
+        "std_threshold": float(np.std(thresholds)),
+        "auroc": float(np.nanmean(test_aurocs)),
+        "std_auroc": float(np.nanstd(test_aurocs)),
+        "auprc": float(np.nanmean(test_auprcs)),
+        "std_auprc": float(np.nanstd(test_auprcs)),
+        "partial_auc": float(np.nanmean(test_partial_aucs)),
+        "std_partial_auc": float(np.nanstd(test_partial_aucs)),
+        "fold_results": fold_results,
+        "fold_sizes": fold_sizes,
+        "min_fold_size": min_fold_size,
+        "n_folds": n_folds,
+        "n_samples": len(samples),
+        "n_positive": int(np.sum(labels == 1)),
+        "n_negative": int(np.sum(labels == 0)),
+        "target_fpr": target_fpr,  # Include for reference
+    }
+
+
+def _single_bootstrap_iteration(
+    dev_samples: np.ndarray,
+    dev_labels: np.ndarray,
+    test_samples: np.ndarray,
+    test_labels: np.ndarray,
+    k_samples: int,
+    aggregation: str,
+    target_fpr: float,
+    conservative: bool,
+    iteration_seed: int,
+    min_samples_for_bootstrap: int = 10,
+    dev_difficulty: np.ndarray | None = None,
+    dev_actual_correct: np.ndarray | None = None,
+    test_difficulty: np.ndarray | None = None,
+    test_actual_correct: np.ndarray | None = None,
+) -> dict:
+    """
+    Execute a single bootstrap iteration of the full pipeline.
+
+    For one iteration:
+    1. Sample k questions from dev → aggregate → compute threshold
+    2. Sample k questions from test → aggregate → evaluate at threshold
+
+    Returns metrics for this single iteration.
+    """
+    from src.detection_game.utils.aggregation_stats import (
+        CORRELATION_AGGREGATIONS,
+        compute_kendall_difficulty,
+        compute_spearman_difficulty,
+        compute_statistic,
+    )
+
+    rng = np.random.default_rng(iteration_seed)
+
+    # Get indices for each class in dev
+    dev_sandbagging_idx = np.where(dev_labels == 1)[0]
+    dev_normal_idx = np.where(dev_labels == 0)[0]
+
+    # Get indices for each class in test
+    test_sandbagging_idx = np.where(test_labels == 1)[0]
+    test_normal_idx = np.where(test_labels == 0)[0]
+
+    # Check if this is a correlation-based aggregation
+    is_correlation_agg = aggregation in CORRELATION_AGGREGATIONS
+
+    # Select correlation function
+    if aggregation == "spearman_difficulty":
+        correlation_func = compute_spearman_difficulty
+    elif aggregation == "kendall_difficulty":
+        correlation_func = compute_kendall_difficulty
+    else:
+        correlation_func = None
+
+    def aggregate_k_samples(
+        samples: np.ndarray,
+        indices: np.ndarray,
+        difficulty: np.ndarray | None,
+        actual_correct: np.ndarray | None,
+        rng: np.random.Generator,
+    ) -> float | None:
+        """Sample k indices and compute aggregated score."""
+        if len(indices) < min_samples_for_bootstrap:
+            return None
+
+        # Sample k indices with replacement
+        boot_idx = rng.choice(indices, size=k_samples, replace=True)
+
+        if is_correlation_agg:
+            if difficulty is None or actual_correct is None:
+                return None
+            return correlation_func(difficulty[boot_idx], actual_correct[boot_idx])
+        else:
+            return compute_statistic(samples[boot_idx], aggregation)
+
+    # --- Stage 1: Sample dev, compute threshold ---
+    dev_sandbag_score = aggregate_k_samples(
+        dev_samples, dev_sandbagging_idx, dev_difficulty, dev_actual_correct, rng
+    )
+    dev_normal_score = aggregate_k_samples(
+        dev_samples, dev_normal_idx, dev_difficulty, dev_actual_correct, rng
+    )
+
+    if dev_sandbag_score is None or dev_normal_score is None:
+        return {"valid": False}
+
+    if np.isnan(dev_sandbag_score) or np.isnan(dev_normal_score):
+        return {"valid": False}
+
+    # Build dev aggregated arrays (one sample per class)
+    dev_agg_scores = np.array([dev_sandbag_score, dev_normal_score])
+    dev_agg_labels = np.array([1, 0])
+
+    # Compute threshold on this dev sample
+    threshold_result = compute_threshold_on_split(
+        dev_agg_scores, dev_agg_labels, target_fpr, conservative
+    )
+    threshold = threshold_result["threshold"]
+
+    if np.isnan(threshold):
+        return {"valid": False}
+
+    # --- Stage 2: Sample test, evaluate at threshold ---
+    test_sandbag_score = aggregate_k_samples(
+        test_samples, test_sandbagging_idx, test_difficulty, test_actual_correct, rng
+    )
+    test_normal_score = aggregate_k_samples(
+        test_samples, test_normal_idx, test_difficulty, test_actual_correct, rng
+    )
+
+    if test_sandbag_score is None or test_normal_score is None:
+        return {"valid": False}
+
+    if np.isnan(test_sandbag_score) or np.isnan(test_normal_score):
+        return {"valid": False}
+
+    # Evaluate: Is sandbagging detected (score >= threshold)?
+    # Recall = 1 if sandbagging score >= threshold, else 0
+    # FPR = 1 if normal score >= threshold (false positive), else 0
+    recall = 1.0 if test_sandbag_score >= threshold else 0.0
+    fpr = 1.0 if test_normal_score >= threshold else 0.0
+
+    return {
+        "valid": True,
+        "threshold": threshold,
+        "recall": recall,
+        "fpr": fpr,
+        "dev_sandbag_score": dev_sandbag_score,
+        "dev_normal_score": dev_normal_score,
+        "test_sandbag_score": test_sandbag_score,
+        "test_normal_score": test_normal_score,
+    }
+
+
+def split_bootstrap_cv(
+    dev_samples: np.ndarray,
+    dev_labels: np.ndarray,
+    test_samples: np.ndarray,
+    test_labels: np.ndarray,
+    k_samples: int,
+    n_iterations: int,
+    aggregation: str,
+    target_fpr: float,
+    conservative: bool,
+    seed: int,
+    allow_k_greater_than_n: bool = False,
+    warn_on_small_n: bool = False,
+    min_samples_for_bootstrap: int = 10,
+    dev_difficulty: np.ndarray | None = None,
+    dev_actual_correct: np.ndarray | None = None,
+    test_difficulty: np.ndarray | None = None,
+    test_actual_correct: np.ndarray | None = None,
+    full_pipeline_bootstrap: bool = False,
+) -> dict:
+    """
+    Perform split-based bootstrap CV: threshold on dev, evaluate on test.
+
+    This is the dev/test split protocol recommended for ICML experiments.
+
+    Two modes available:
+
+    **full_pipeline_bootstrap=False (default, recommended)**:
+    1. Bootstrap aggregate ALL dev samples → compute single robust threshold
+    2. Bootstrap aggregate ALL test samples → n_iterations aggregated scores
+    3. For each test aggregate: check if detected (score >= threshold)
+    4. Report mean recall, bootstrap SEM, and 95% CI from the n_iterations outcomes
+
+    This gives stable threshold (from all dev data) with proper variance estimation
+    on test detection rate.
+
+    **full_pipeline_bootstrap=True**:
+    For each bootstrap iteration:
+    1. Sample k questions from dev → aggregate → compute threshold_i
+    2. Sample k questions from test → aggregate → evaluate recall_i at threshold_i
+    3. Collect recalls across iterations → report mean, SEM, 95% CI
+
+    This captures FULL variance including threshold selection variance, but the
+    threshold is less stable (computed from only k samples per iteration).
+
+    Args:
+        dev_samples: Dev set scores
+        dev_labels: Dev set labels
+        test_samples: Test set scores
+        test_labels: Test set labels
+        k_samples: Number of samples per bootstrap iteration
+        n_iterations: Number of bootstrap iterations
+        aggregation: Aggregation method
+        target_fpr: Target FPR for threshold selection
+        conservative: Use conservative thresholding (FPR ≤ target)
+        seed: Random seed
+        allow_k_greater_than_n: Allow k > n with replacement
+        warn_on_small_n: Warn when k > n
+        min_samples_for_bootstrap: Minimum samples per class
+        dev_difficulty: Optional dev difficulty values
+        dev_actual_correct: Optional dev correctness values
+        test_difficulty: Optional test difficulty values
+        test_actual_correct: Optional test correctness values
+        full_pipeline_bootstrap: If True, bootstrap entire pipeline including
+            threshold selection. If False (default), use fixed-threshold mode
+            with bootstrap variance on test.
+
+    Returns:
+        Dictionary with split CV results including variance estimates
+    """
+    from sklearn.metrics import average_precision_score, roc_auc_score
+
+    # Validate inputs
+    n_dev_positive = int(np.sum(dev_labels == 1))
+    n_dev_negative = int(np.sum(dev_labels == 0))
+    n_test_positive = int(np.sum(test_labels == 1))
+    n_test_negative = int(np.sum(test_labels == 0))
+
+    base_metadata = {
+        "n_dev_samples": len(dev_samples),
+        "n_dev_positive": n_dev_positive,
+        "n_dev_negative": n_dev_negative,
+        "n_test_samples": len(test_samples),
+        "n_test_positive": n_test_positive,
+        "n_test_negative": n_test_negative,
+        "target_fpr": target_fpr,
+        "k_samples": k_samples,
+        "n_iterations": n_iterations,
+        "aggregation": aggregation,
+    }
+
+    if full_pipeline_bootstrap:
+        # =========================================================
+        # FULL PIPELINE BOOTSTRAP: Captures all variance sources
+        # =========================================================
+        recalls = []
+        fprs = []
+        thresholds = []
+
+        for i in range(n_iterations):
+            iteration_seed = seed + i
+
+            result = _single_bootstrap_iteration(
+                dev_samples=dev_samples,
+                dev_labels=dev_labels,
+                test_samples=test_samples,
+                test_labels=test_labels,
+                k_samples=k_samples,
+                aggregation=aggregation,
+                target_fpr=target_fpr,
+                conservative=conservative,
+                iteration_seed=iteration_seed,
+                min_samples_for_bootstrap=min_samples_for_bootstrap,
+                dev_difficulty=dev_difficulty,
+                dev_actual_correct=dev_actual_correct,
+                test_difficulty=test_difficulty,
+                test_actual_correct=test_actual_correct,
+            )
+
+            if result["valid"]:
+                recalls.append(result["recall"])
+                fprs.append(result["fpr"])
+                thresholds.append(result["threshold"])
+
+        # Check if we have enough valid iterations
+        n_valid = len(recalls)
+        if n_valid < 10:
+            print(f"  ⚠️  WARNING: Only {n_valid}/{n_iterations} valid bootstrap iterations!")
+            if n_valid == 0:
+                return {
+                    **base_metadata,
+                    "full_pipeline_bootstrap": True,
+                    "test_recall": float("nan"),
+                    "sem_recall": float("nan"),
+                    "ci_lower_recall": float("nan"),
+                    "ci_upper_recall": float("nan"),
+                    "test_fpr": float("nan"),
+                    "sem_fpr": float("nan"),
+                    "threshold": float("nan"),
+                    "sem_threshold": float("nan"),
+                    "n_valid_iterations": 0,
+                }
+
+        recalls = np.array(recalls)
+        fprs = np.array(fprs)
+        thresholds = np.array(thresholds)
+
+        # Compute statistics
+        # SEM = std of bootstrap estimates (not std/sqrt(n), since bootstrap
+        # directly estimates the sampling distribution)
+        return {
+            **base_metadata,
+            "full_pipeline_bootstrap": True,
+            # Primary metrics with variance
+            "test_recall": float(np.mean(recalls)),
+            "sem_recall": float(np.std(recalls)),
+            "ci_lower_recall": float(np.percentile(recalls, 2.5)),
+            "ci_upper_recall": float(np.percentile(recalls, 97.5)),
+            # FPR statistics
+            "test_fpr": float(np.mean(fprs)),
+            "sem_fpr": float(np.std(fprs)),
+            "ci_lower_fpr": float(np.percentile(fprs, 2.5)),
+            "ci_upper_fpr": float(np.percentile(fprs, 97.5)),
+            # Threshold statistics (shows dev set stability)
+            "threshold": float(np.mean(thresholds)),
+            "sem_threshold": float(np.std(thresholds)),
+            "ci_lower_threshold": float(np.percentile(thresholds, 2.5)),
+            "ci_upper_threshold": float(np.percentile(thresholds, 97.5)),
+            # Iteration metadata
+            "n_valid_iterations": n_valid,
+            # Legacy compatibility fields (point estimates)
+            "dev_fpr": target_fpr,  # Target, since threshold computed per-iteration
+            "dev_recall": float("nan"),  # Not applicable in full pipeline mode
+            "test_precision": float("nan"),  # Would need per-iteration calculation
+            "test_auroc": float("nan"),  # Single iteration doesn't have AUROC
+            "test_auprc": float("nan"),
+            "test_partial_auc": float("nan"),
+        }
+
+    else:
+        # =========================================================
+        # LEGACY MODE: Fixed threshold (for backwards compatibility)
+        # =========================================================
+        # Bootstrap aggregate dev set
+        dev_agg_scores, dev_agg_labels = bootstrap_aggregate(
+            dev_samples,
+            dev_labels,
+            k_samples,
+            n_iterations,
+            aggregation,
+            seed,
+            allow_k_greater_than_n=allow_k_greater_than_n,
+            warn_on_small_n=warn_on_small_n,
+            min_samples_for_bootstrap=min_samples_for_bootstrap,
+            difficulty=dev_difficulty,
+            actual_correct=dev_actual_correct,
+        )
+
+        # Bootstrap aggregate test set
+        test_agg_scores, test_agg_labels = bootstrap_aggregate(
+            test_samples,
+            test_labels,
+            k_samples,
+            n_iterations,
+            aggregation,
+            seed + 1000,  # Different seed for test
+            allow_k_greater_than_n=allow_k_greater_than_n,
+            warn_on_small_n=warn_on_small_n,
+            min_samples_for_bootstrap=min_samples_for_bootstrap,
+            difficulty=test_difficulty,
+            actual_correct=test_actual_correct,
+        )
+
+        # Filter NaN values
+        dev_valid_mask = ~np.isnan(dev_agg_scores)
+        test_valid_mask = ~np.isnan(test_agg_scores)
+
+        if dev_valid_mask.sum() < 5 or test_valid_mask.sum() < 5:
+            print("  ⚠️  WARNING: Too many NaN values in aggregated scores!")
+            print(f"     Dev: {(~dev_valid_mask).sum()}/{len(dev_agg_scores)} NaN")
+            print(f"     Test: {(~test_valid_mask).sum()}/{len(test_agg_scores)} NaN")
+            return {
+                **base_metadata,
+                "full_pipeline_bootstrap": False,
+                "threshold": float("nan"),
+                "dev_fpr": float("nan"),
+                "dev_recall": float("nan"),
+                "test_fpr": float("nan"),
+                "test_recall": float("nan"),
+                "sem_recall": float("nan"),
+                "ci_lower_recall": float("nan"),
+                "ci_upper_recall": float("nan"),
+                "sem_fpr": float("nan"),
+                "ci_lower_fpr": float("nan"),
+                "ci_upper_fpr": float("nan"),
+                "test_precision": float("nan"),
+                "test_auroc": float("nan"),
+                "test_auprc": float("nan"),
+                "test_partial_auc": float("nan"),
+            }
+
+        dev_agg_scores = dev_agg_scores[dev_valid_mask]
+        dev_agg_labels = dev_agg_labels[dev_valid_mask]
+        test_agg_scores = test_agg_scores[test_valid_mask]
+        test_agg_labels = test_agg_labels[test_valid_mask]
+
+        # Compute threshold on dev set
+        threshold_result = compute_threshold_on_split(
+            dev_agg_scores, dev_agg_labels, target_fpr, conservative
+        )
+
+        # Evaluate on test set
+        eval_result = evaluate_with_threshold(
+            test_agg_scores, test_agg_labels, threshold_result["threshold"]
+        )
+
+        # Compute per-sample binary outcomes for variance estimation
+        # Each bootstrap aggregate is an independent sample - track if detected
+        threshold = threshold_result["threshold"]
+
+        # Sandbagging samples: recall = 1 if score >= threshold
+        sandbag_mask = test_agg_labels == 1
+        sandbag_scores = test_agg_scores[sandbag_mask]
+        sandbag_detected = (sandbag_scores >= threshold).astype(float)
+
+        # Normal samples: FPR = 1 if score >= threshold (false positive)
+        normal_mask = test_agg_labels == 0
+        normal_scores = test_agg_scores[normal_mask]
+        normal_fp = (normal_scores >= threshold).astype(float)
+
+        # Compute bootstrap SEM (std of binary outcomes)
+        # For n_iterations bootstrap samples, std gives the SEM
+        sem_recall = float(np.std(sandbag_detected)) if len(sandbag_detected) > 1 else 0.0
+        sem_fpr = float(np.std(normal_fp)) if len(normal_fp) > 1 else 0.0
+
+        # Compute 95% CI using percentiles of binary outcomes
+        # Note: For binary data, percentiles give the same mean, so we use
+        # normal approximation: mean ± 1.96 * SEM
+        mean_recall = float(np.mean(sandbag_detected)) if len(sandbag_detected) > 0 else float("nan")
+        mean_fpr = float(np.mean(normal_fp)) if len(normal_fp) > 0 else float("nan")
+
+        ci_lower_recall = max(0.0, mean_recall - 1.96 * sem_recall)
+        ci_upper_recall = min(1.0, mean_recall + 1.96 * sem_recall)
+        ci_lower_fpr = max(0.0, mean_fpr - 1.96 * sem_fpr)
+        ci_upper_fpr = min(1.0, mean_fpr + 1.96 * sem_fpr)
+
+        # Compute AUROC on test
+        try:
+            test_auroc = roc_auc_score(test_agg_labels, test_agg_scores)
+        except ValueError:
+            test_auroc = float("nan")
+
+        # Compute AUPRC on test
+        try:
+            test_auprc = average_precision_score(test_agg_labels, test_agg_scores)
+        except ValueError:
+            test_auprc = float("nan")
+
+        # Compute partial AUC at target FPR
+        try:
+            test_partial_auc = roc_auc_score(
+                test_agg_labels, test_agg_scores, max_fpr=target_fpr
+            )
+        except ValueError:
+            test_partial_auc = float("nan")
+
+        return {
+            **base_metadata,
+            "full_pipeline_bootstrap": False,
+            "threshold": threshold_result["threshold"],
+            "dev_fpr": threshold_result["actual_fpr"],
+            "dev_recall": threshold_result["recall_at_threshold"],
+            # Test metrics with variance (bootstrap SEM)
+            "test_recall": mean_recall,
+            "sem_recall": sem_recall,
+            "ci_lower_recall": ci_lower_recall,
+            "ci_upper_recall": ci_upper_recall,
+            "test_fpr": mean_fpr,
+            "sem_fpr": sem_fpr,
+            "ci_lower_fpr": ci_lower_fpr,
+            "ci_upper_fpr": ci_upper_fpr,
+            "test_precision": eval_result["precision"],
+            "test_auroc": test_auroc,
+            "test_auprc": test_auprc,
+            "test_partial_auc": test_partial_auc,
+            "n_dev_bootstrap": len(dev_agg_scores),
+            "n_test_bootstrap": len(test_agg_scores),
+            "n_test_sandbag_samples": len(sandbag_detected),
+            "n_test_normal_samples": len(normal_fp),
+        }
+
+
+def run_split_analysis(
+    dev_samples: np.ndarray,
+    dev_labels: np.ndarray,
+    test_samples: np.ndarray,
+    test_labels: np.ndarray,
+    args: Any,
+    score_col: str,
+    model_pair: str | None = None,
+    aggregation: str | None = None,
+    dev_difficulty: np.ndarray | None = None,
+    dev_actual_correct: np.ndarray | None = None,
+    test_difficulty: np.ndarray | None = None,
+    test_actual_correct: np.ndarray | None = None,
+) -> dict:
+    """
+    Run split-based bootstrap analysis (threshold on dev, evaluate on test).
+
+    Args:
+        dev_samples: Dev set scores
+        dev_labels: Dev set labels
+        test_samples: Test set scores
+        test_labels: Test set labels
+        args: Command-line arguments
+        score_col: Name of score column
+        model_pair: Optional model pair identifier
+        aggregation: Specific aggregation to use
+        dev_difficulty: Optional dev difficulty values
+        dev_actual_correct: Optional dev correctness values
+        test_difficulty: Optional test difficulty values
+        test_actual_correct: Optional test correctness values
+
+    Returns:
+        Dictionary with analysis results
+    """
+    agg = aggregation if aggregation is not None else args.aggregation
+
+    # Get full_pipeline_bootstrap from args (default False - fixed threshold mode)
+    full_pipeline_bootstrap = getattr(args, "full_pipeline_bootstrap", False)
+
+    print(f"Dev set: {len(dev_samples)} samples")
+    print(f"  Sandbagging: {np.sum(dev_labels == 1)}")
+    print(f"  Normal: {np.sum(dev_labels == 0)}")
+    print(f"Test set: {len(test_samples)} samples")
+    print(f"  Sandbagging: {np.sum(test_labels == 1)}")
+    print(f"  Normal: {np.sum(test_labels == 0)}")
+    print()
+
+    # Run split-based bootstrap CV
+    mode_str = "full pipeline" if full_pipeline_bootstrap else "fixed threshold"
+    print(f"K={args.k_samples} (split bootstrap [{mode_str}], aggregation={agg}):")
+    split_results = split_bootstrap_cv(
+        dev_samples,
+        dev_labels,
+        test_samples,
+        test_labels,
+        args.k_samples,
+        args.n_iterations,
+        agg,
+        args.target_fpr,
+        args.cv_conservative,
+        args.seed,
+        allow_k_greater_than_n=args.allow_k_greater_than_n,
+        warn_on_small_n=args.warn_on_small_n,
+        min_samples_for_bootstrap=args.min_samples_for_bootstrap,
+        dev_difficulty=dev_difficulty,
+        dev_actual_correct=dev_actual_correct,
+        test_difficulty=test_difficulty,
+        test_actual_correct=test_actual_correct,
+        full_pipeline_bootstrap=full_pipeline_bootstrap,
+    )
+
+    # Print results based on mode
+    if split_results.get("full_pipeline_bootstrap", False):
+        # Full pipeline bootstrap mode - show variance estimates
+        recall = split_results["test_recall"]
+        sem_recall = split_results.get("sem_recall", 0)
+        ci_lower = split_results.get("ci_lower_recall", recall)
+        ci_upper = split_results.get("ci_upper_recall", recall)
+        threshold = split_results["threshold"]
+        sem_threshold = split_results.get("sem_threshold", 0)
+        test_fpr = split_results["test_fpr"]
+        sem_fpr = split_results.get("sem_fpr", 0)
+        n_valid = split_results.get("n_valid_iterations", args.n_iterations)
+
+        print(f"  Threshold: {threshold:.4f} ± {sem_threshold:.4f}")
+        print(f"  Test Recall @ {args.target_fpr:.0%} FPR: {recall:.3f} ± {sem_recall:.3f}")
+        print(f"    95% CI: [{ci_lower:.3f}, {ci_upper:.3f}]")
+        print(f"  Test FPR: {test_fpr:.4f} ± {sem_fpr:.4f}")
+        print(f"  Valid iterations: {n_valid}/{args.n_iterations}")
+    else:
+        # Fixed-threshold mode with bootstrap variance on test
+        recall = split_results["test_recall"]
+        sem_recall = split_results.get("sem_recall", 0)
+        ci_lower = split_results.get("ci_lower_recall", recall)
+        ci_upper = split_results.get("ci_upper_recall", recall)
+        test_fpr = split_results["test_fpr"]
+        sem_fpr = split_results.get("sem_fpr", 0)
+
+        print(f"  Threshold (from dev): {split_results['threshold']:.4f}")
+        print(f"  Dev FPR: {split_results['dev_fpr']:.4f}")
+        print(f"  Dev Recall: {split_results['dev_recall']:.3f}")
+        print(f"  Test Recall @ {args.target_fpr:.0%} FPR: {recall:.3f} ± {sem_recall:.3f}")
+        print(f"    95% CI: [{ci_lower:.3f}, {ci_upper:.3f}]")
+        print(f"  Test FPR: {test_fpr:.4f} ± {sem_fpr:.4f}")
+        print(f"  Test AUROC: {split_results['test_auroc']:.3f}")
+        print(f"  Test pAUC@{args.target_fpr:.0%}: {split_results['test_partial_auc']:.3f}")
+        print(f"  Bootstrap samples: {split_results.get('n_test_bootstrap', 'N/A')}")
+    print()
+
+    results = {
+        "split_cv": split_results,
+        "config": vars(args),
+        "score_column": score_col,
+        "aggregation": agg,
+    }
+
+    if model_pair:
+        results["model_pair"] = model_pair
+
+    return results
+
+
+def run_analysis(
+    samples: np.ndarray,
+    labels: np.ndarray,
+    groups: np.ndarray | None,
+    args: Any,
+    score_col: str,
+    model_pair: str | None = None,
+    aggregation: str | None = None,
+    difficulty: np.ndarray | None = None,
+    actual_correct: np.ndarray | None = None,
+) -> dict:
+    """
+    Run bootstrap CV analysis on a dataset (optionally for a specific model pair).
+
+    Args:
+        samples: Sample scores
+        labels: Ground truth labels
+        groups: Optional group IDs for GroupKFold
+        args: Command-line arguments
+        score_col: Name of score column
+        model_pair: Optional model pair identifier
+        aggregation: Specific aggregation to use (overrides args.aggregation)
+        difficulty: Optional difficulty values (required for spearman_difficulty aggregation)
+        actual_correct: Optional correctness values (required for spearman_difficulty aggregation)
+
+    Returns:
+        Dictionary with analysis results
+    """
+    # Use specified aggregation or fall back to args
+    agg = aggregation if aggregation is not None else args.aggregation
+
+    print(f"Dataset: {len(samples)} samples")
+    print(f"  Sandbagging: {np.sum(labels == 1)}")
+    print(f"  Normal: {np.sum(labels == 0)}")
+    if groups is not None:
+        print(f"  Unique sample_ids: {len(np.unique(groups))}")
+    print()
+
+    # K=1 baseline with CV
+    from src.detection_game.utils.cv_utils import kfold_cross_validate
+
+    print("K=1 Baseline (with CV):")
+    k1_cv = kfold_cross_validate(
+        samples, labels, args.cv_folds, args.target_fpr, args.cv_conservative, args.cv_stratified, args.seed
+    )
+    print(f"  Recall @ {args.target_fpr:.0%} FPR: {k1_cv['mean_recall']:.3f} ± {k1_cv['std_recall']:.3f}")
+    print()
+
+    # K-sample with bootstrap + CV
+    print(f"K={args.k_samples} (bootstrap + CV, aggregation={agg}):")
+    cv_results = cross_validate_bootstrap(
+        samples,
+        labels,
+        args.k_samples,
+        args.n_iterations,
+        agg,
+        args.cv_folds,
+        args.target_fpr,
+        args.cv_conservative,
+        args.cv_stratified,
+        args.seed,
+        groups=groups,
+        allow_k_greater_than_n=args.allow_k_greater_than_n,
+        warn_on_small_n=args.warn_on_small_n,
+        min_samples_for_bootstrap=args.min_samples_for_bootstrap,
+        difficulty=difficulty,
+        actual_correct=actual_correct,
+    )
+    print(f"  Recall @ {args.target_fpr:.0%} FPR: {cv_results['mean_recall']:.3f} ± {cv_results['std_recall']:.3f}")
+    print(f"  Actual FPR: {cv_results['mean_fpr']:.4f} ± {cv_results['std_fpr']:.4f}")
+    print(f"  Improvement: {(cv_results['mean_recall'] - k1_cv['mean_recall']) * 100:+.1f} pp")
+    print()
+
+    # Compute AUROC/AUPRC on full bootstrapped data (no CV, for reference)
+    from src.detection_game.scorers.metrics import compute_entropy_recall_at_fpr
+
+    full_agg_scores, full_agg_labels = bootstrap_aggregate(
+        samples,
+        labels,
+        args.k_samples,
+        args.n_iterations,
+        agg,
+        args.seed,
+        allow_k_greater_than_n=args.allow_k_greater_than_n,
+        warn_on_small_n=args.warn_on_small_n,
+        min_samples_for_bootstrap=args.min_samples_for_bootstrap,
+        difficulty=difficulty,
+        actual_correct=actual_correct,
+    )
+
+    # Check for NaN values in aggregated scores
+    if np.isnan(full_agg_scores).any():
+        nan_count = np.isnan(full_agg_scores).sum()
+        print(
+            f"⚠ Warning: {nan_count}/{len(full_agg_scores)} aggregated scores are NaN (likely due to identical/near-identical values)"
+        )
+        print(f"  Aggregation '{agg}' may not be suitable for this data")
+        # Filter out NaN values for metrics computation
+        valid_mask = ~np.isnan(full_agg_scores)
+        if valid_mask.sum() < 10:  # Need at least some valid samples
+            print(f"  Too few valid samples ({valid_mask.sum()}), skipping metrics")
+            full_metrics = {"auc": float("nan"), "auprc": float("nan"), "recall": float("nan")}
+        else:
+            full_metrics = compute_entropy_recall_at_fpr(
+                full_agg_scores[valid_mask], full_agg_labels[valid_mask], args.target_fpr
+            )
+    else:
+        full_metrics = compute_entropy_recall_at_fpr(full_agg_scores, full_agg_labels, args.target_fpr)
+
+    print("Full aggregated metrics (reference, no CV):")
+    print(f"  AUROC: {full_metrics['auc']:.3f}")
+    print(f"  AUPRC: {full_metrics['auprc']:.3f}")
+    print(f"  pAUC@{args.target_fpr:.0%}FPR: {full_metrics.get('partial_auc', float('nan')):.3f}")
+
+    results = {
+        "k1_cv": k1_cv,
+        "k_sample_cv": cv_results,
+        "full_metrics": full_metrics,
+        "config": vars(args),
+        "score_column": score_col,
+        "aggregation": agg,
+    }
+
+    if model_pair:
+        results["model_pair"] = model_pair
+
+    return results
+
+
+def run_aggregation_comparison(
+    samples: np.ndarray,
+    labels: np.ndarray,
+    groups: np.ndarray | None,
+    args: Any,
+    score_col: str,
+    model_pair: str | None = None,
+    difficulty: np.ndarray | None = None,
+    actual_correct: np.ndarray | None = None,
+) -> dict:
+    """
+    Compare multiple aggregation methods with cross-validation.
+
+    Args:
+        samples: Sample scores
+        labels: Ground truth labels
+        groups: Optional group IDs for GroupKFold
+        args: Command-line arguments
+        score_col: Name of score column
+        model_pair: Optional model pair identifier
+        difficulty: Optional difficulty values (required for spearman_difficulty aggregation)
+        actual_correct: Optional correctness values (required for spearman_difficulty aggregation)
+
+    Returns:
+        Dictionary mapping aggregation names to results
+    """
+    print(f"\n{'=' * 70}")
+    print(f"COMPARING {len(args.aggregations)} AGGREGATION METHODS")
+    print(f"{'=' * 70}\n")
+
+    all_results = {}
+
+    # Determine number of workers
+    n_jobs = args.n_jobs
+    if n_jobs == -1:
+        import os
+
+        n_jobs = os.cpu_count() or 1
+
+    # Run in parallel if n_jobs > 1
+    if n_jobs > 1 and len(args.aggregations) > 1:
+        print(f"Running {len(args.aggregations)} aggregations in parallel with {n_jobs} workers\n")
+
+        # Prepare tasks
+        tasks = []
+        for agg in args.aggregations:
+            task_params = {
+                "identifier": agg,
+                "samples": samples,
+                "labels": labels,
+                "groups": groups,
+                "args": args,
+                "score_col": score_col,
+                "model_pair": model_pair,
+                "aggregation": agg,
+                "difficulty": difficulty,
+                "actual_correct": actual_correct,
+            }
+            tasks.append(task_params)
+
+        # Execute in parallel
+        with ProcessPoolExecutor(max_workers=n_jobs) as executor:
+            futures = {executor.submit(_run_single_analysis, task): task["identifier"] for task in tasks}
+
+            for i, future in enumerate(as_completed(futures), 1):
+                agg_name = futures[future]
+                print(f"[{i}/{len(args.aggregations)}] Completed: {agg_name}")
+                agg, results = future.result()
+                all_results[agg] = results
+    else:
+        # Sequential execution
+        for i, agg in enumerate(args.aggregations, 1):
+            print(f"\n[{i}/{len(args.aggregations)}] Testing aggregation: {agg}")
+            print(f"{'-' * 70}\n")
+
+            results = run_analysis(
+                samples, labels, groups, args, score_col, model_pair,
+                aggregation=agg, difficulty=difficulty, actual_correct=actual_correct
+            )
+            all_results[agg] = results
+
+    # Print comparison table
+    print(f"\n{'=' * 70}")
+    print("AGGREGATION COMPARISON SUMMARY")
+    print(f"{'=' * 70}\n")
+
+    # Sort by recall (descending)
+    sorted_aggs = sorted(args.aggregations, key=lambda a: all_results[a]["k_sample_cv"]["mean_recall"], reverse=True)
+
+    print(f"{'Aggregation':<20} {'Recall':>10} {'±':>5} {'AUROC':>8} {'pAUC':>8} {'AUPRC':>8} {'Improvement':>12}")
+    print(f"{'-' * 85}")
+
+    for agg in sorted_aggs:
+        res = all_results[agg]
+        recall = res["k_sample_cv"]["mean_recall"]
+        recall_std = res["k_sample_cv"]["std_recall"]
+        auroc = res["full_metrics"]["auc"]
+        partial_auc = res["full_metrics"].get("partial_auc", float("nan"))
+        auprc = res["full_metrics"]["auprc"]
+        k1_recall = res["k1_cv"]["mean_recall"]
+        improvement = (recall - k1_recall) * 100
+
+        print(
+            f"{agg:<20} {recall:>10.3f} {recall_std:>5.3f} {auroc:>8.3f} "
+            f"{partial_auc:>8.3f} {auprc:>8.3f} {improvement:>11.1f} pp"
+        )
+
+    best_agg = sorted_aggs[0]
+    print(f"\n✓ Best aggregation: {best_agg}")
+    print(f"  Recall: {all_results[best_agg]['k_sample_cv']['mean_recall']:.3f}")
+    print(f"  pAUC: {all_results[best_agg]['full_metrics'].get('partial_auc', float('nan')):.3f}")
+
+    return all_results
+
+
+def run_paired_comparison(
+    df: pd.DataFrame,
+    sandbagging_pairs: list[str],
+    normal_model: str,
+    has_sample_id: bool,
+    score_col: str,
+    args: Any,
+) -> dict[str, dict]:
+    """
+    Run paired comparison: each sandbagging model vs specified normal model.
+
+    Args:
+        df: Full dataframe with all models
+        sandbagging_pairs: List of sandbagging model_pair identifiers
+        normal_model: The normal model_pair to use for comparison
+        has_sample_id: Whether sample_id column exists
+        score_col: Name of score column
+        args: Command-line arguments
+
+    Returns:
+        Dictionary mapping comparison names to results
+    """
+    normal_df = df[df["model_pair"] == normal_model].copy()
+    all_results = {}
+
+    # Check for difficulty/actual_correct columns
+    has_difficulty = "difficulty" in df.columns
+    has_actual_correct = "actual_correct" in df.columns
+
+    print(f"Paired comparison mode: Comparing each sandbagging model vs {normal_model}\n")
+
+    for sandbag_pair in sandbagging_pairs:
+        print(f"\n{'=' * 70}")
+        print(f"COMPARISON: {sandbag_pair} vs {normal_model}")
+        print(f"{'=' * 70}\n")
+
+        # Combine sandbagging + normal data
+        sandbag_df = df[df["model_pair"] == sandbag_pair].copy()
+        pair_df = pd.concat([sandbag_df, normal_df], ignore_index=True)
+
+        # Extract samples and labels
+        samples = pair_df[score_col].values
+        labels = pair_df["ground_truth_label"].values
+        groups = pair_df["sample_id"].values if has_sample_id else None
+        difficulty = pair_df["difficulty"].values if has_difficulty else None
+        actual_correct = pair_df["actual_correct"].values if has_actual_correct else None
+
+        # Run analysis for this paired comparison
+        comparison_name = f"{sandbag_pair}_vs_{normal_model}"
+        if args.compare_aggregations:
+            pair_results = run_aggregation_comparison(
+                samples, labels, groups, args, score_col, comparison_name,
+                difficulty=difficulty, actual_correct=actual_correct
+            )
+        else:
+            pair_results = run_analysis(
+                samples, labels, groups, args, score_col, comparison_name,
+                difficulty=difficulty, actual_correct=actual_correct
+            )
+        all_results[comparison_name] = pair_results
+
+        # Save per-pair results
+        if args.output_json:
+            base_name = args.output_json.replace(".json", "")
+            safe_pair_name = comparison_name.replace("/", "_").replace("\\", "_")
+            pair_output = f"{base_name}_{safe_pair_name}.json"
+            with open(pair_output, "w") as f:
+                json.dump(pair_results, f, indent=2, default=lambda x: float(x) if isinstance(x, np.floating) else x)
+            print(f"\nPer-pair results saved to: {pair_output}")
+
+    return all_results
+
+
+def run_pooled_comparison(
+    df: pd.DataFrame,
+    sandbagging_pairs: list[str],
+    normal_pairs: list[str],
+    has_sample_id: bool,
+    score_col: str,
+    args: Any,
+) -> dict[str, dict]:
+    """
+    Run pooled comparison: all sandbagging models vs all normal models combined.
+
+    Args:
+        df: Full dataframe with all models
+        sandbagging_pairs: List of sandbagging model_pair identifiers
+        normal_pairs: List of normal model_pair identifiers
+        has_sample_id: Whether sample_id column exists
+        score_col: Name of score column
+        args: Command-line arguments
+
+    Returns:
+        Dictionary with single pooled result
+    """
+    print("Pooled comparison mode: All sandbagging models vs all normal models combined\n")
+    print(f"  Sandbagging models: {len(sandbagging_pairs)}")
+    for pair in sandbagging_pairs:
+        print(f"    - {pair}")
+    print(f"  Normal models: {len(normal_pairs)}")
+    for pair in normal_pairs:
+        print(f"    - {pair}")
+    print()
+
+    # Check for difficulty/actual_correct columns
+    has_difficulty = "difficulty" in df.columns
+    has_actual_correct = "actual_correct" in df.columns
+
+    # Combine all sandbagging data
+    sandbag_dfs = [df[df["model_pair"] == pair] for pair in sandbagging_pairs]
+    all_sandbag_df = pd.concat(sandbag_dfs, ignore_index=True)
+
+    # Combine all normal data
+    normal_dfs = [df[df["model_pair"] == pair] for pair in normal_pairs]
+    all_normal_df = pd.concat(normal_dfs, ignore_index=True)
+
+    # Combine both
+    pooled_df = pd.concat([all_sandbag_df, all_normal_df], ignore_index=True)
+
+    print(f"\n{'=' * 70}")
+    print("POOLED COMPARISON: All sandbagging vs all normal")
+    print(f"{'=' * 70}\n")
+
+    # Extract samples and labels
+    samples = pooled_df[score_col].values
+    labels = pooled_df["ground_truth_label"].values
+    groups = pooled_df["sample_id"].values if has_sample_id else None
+    difficulty = pooled_df["difficulty"].values if has_difficulty else None
+    actual_correct = pooled_df["actual_correct"].values if has_actual_correct else None
+
+    # Run analysis on pooled data
+    if args.compare_aggregations:
+        pooled_results = run_aggregation_comparison(
+            samples, labels, groups, args, score_col, "pooled_all_vs_all",
+            difficulty=difficulty, actual_correct=actual_correct
+        )
+    else:
+        pooled_results = run_analysis(
+            samples, labels, groups, args, score_col, "pooled_all_vs_all",
+            difficulty=difficulty, actual_correct=actual_correct
+        )
+
+    # Save results (validated via DetectionReport)
+    output_dict = {"pooled_all_vs_all": pooled_results}
+    report = None
+    if args.output_json:
+        report = _write_report_json(output_dict, args.output_json)
+        print(f"\nPooled results saved to: {args.output_json}")
+
+    return report if report is not None else output_dict
+
+
+def run_all_pairs_comparison(
+    df: pd.DataFrame,
+    sandbagging_pairs: list[str],
+    normal_pairs: list[str],
+    has_sample_id: bool,
+    score_col: str,
+    args: Any,
+) -> dict[str, dict]:
+    """
+    Run all-pairs comparison: every sandbagging model vs every normal model.
+
+    Args:
+        df: Full dataframe with all models
+        sandbagging_pairs: List of sandbagging model_pair identifiers
+        normal_pairs: List of normal model_pair identifiers
+        has_sample_id: Whether sample_id column exists
+        score_col: Name of score column
+        args: Command-line arguments
+
+    Returns:
+        Dictionary mapping comparison names to results
+    """
+    all_results = {}
+    total_comparisons = len(sandbagging_pairs) * len(normal_pairs)
+
+    # Check for difficulty/actual_correct columns
+    has_difficulty = "difficulty" in df.columns
+    has_actual_correct = "actual_correct" in df.columns
+
+    print("All-pairs comparison mode: Every sandbagging model vs every normal model\n")
+    print(f"  Total comparisons: {len(sandbagging_pairs)} × {len(normal_pairs)} = {total_comparisons}\n")
+
+    # Determine number of workers
+    n_jobs = args.n_jobs
+    if n_jobs == -1:
+        import os
+
+        n_jobs = os.cpu_count() or 1
+
+    # Run in parallel if n_jobs > 1 and multiple comparisons
+    if n_jobs > 1 and total_comparisons > 1:
+        print(f"Running {total_comparisons} comparisons in parallel with {n_jobs} workers\n")
+
+        # Prepare tasks
+        tasks = []
+        for sandbag_pair in sandbagging_pairs:
+            for normal_model in normal_pairs:
+                comparison_name = f"{sandbag_pair}_vs_{normal_model}"
+                task_params = {
+                    "comparison_name": comparison_name,
+                    "sandbag_data": df[df["model_pair"] == sandbag_pair].copy(),
+                    "normal_data": df[df["model_pair"] == normal_model].copy(),
+                    "score_col": score_col,
+                    "has_sample_id": has_sample_id,
+                    "has_difficulty": has_difficulty,
+                    "has_actual_correct": has_actual_correct,
+                    "args": args,
+                }
+                tasks.append(task_params)
+
+        # Execute in parallel
+        with ProcessPoolExecutor(max_workers=n_jobs) as executor:
+            futures = {executor.submit(_run_pair_comparison, task): task["comparison_name"] for task in tasks}
+
+            for i, future in enumerate(as_completed(futures), 1):
+                comp_name = futures[future]
+                print(f"[{i}/{total_comparisons}] Completed: {comp_name}")
+                comparison_name, pair_results = future.result()
+                all_results[comparison_name] = pair_results
+
+                # Save per-pair results
+                if args.output_json:
+                    base_name = args.output_json.replace(".json", "")
+                    safe_pair_name = comparison_name.replace("/", "_").replace("\\", "_")
+                    pair_output = f"{base_name}_{safe_pair_name}.json"
+                    with open(pair_output, "w") as f:
+                        json.dump(
+                            pair_results, f, indent=2, default=lambda x: float(x) if isinstance(x, np.floating) else x
+                        )
+    else:
+        # Sequential execution
+        for i, (sandbag_pair, normal_model) in enumerate(((s, n) for s in sandbagging_pairs for n in normal_pairs), 1):
+            print(f"\n[{i}/{total_comparisons}] {'=' * 70}")
+            print(f"COMPARISON: {sandbag_pair} vs {normal_model}")
+            print(f"{'=' * 70}\n")
+
+            # Combine sandbagging + normal data
+            sandbag_df = df[df["model_pair"] == sandbag_pair].copy()
+            normal_df = df[df["model_pair"] == normal_model].copy()
+            pair_df = pd.concat([sandbag_df, normal_df], ignore_index=True)
+
+            # Extract samples and labels
+            samples = pair_df[score_col].values
+            labels = pair_df["ground_truth_label"].values
+            groups = pair_df["sample_id"].values if has_sample_id else None
+            difficulty = pair_df["difficulty"].values if has_difficulty else None
+            actual_correct = pair_df["actual_correct"].values if has_actual_correct else None
+
+            # Run analysis for this comparison
+            comparison_name = f"{sandbag_pair}_vs_{normal_model}"
+            if args.compare_aggregations:
+                pair_results = run_aggregation_comparison(
+                    samples, labels, groups, args, score_col, comparison_name,
+                    difficulty=difficulty, actual_correct=actual_correct
+                )
+            else:
+                pair_results = run_analysis(
+                    samples, labels, groups, args, score_col, comparison_name,
+                    difficulty=difficulty, actual_correct=actual_correct
+                )
+            all_results[comparison_name] = pair_results
+
+            # Save per-pair results
+            if args.output_json:
+                base_name = args.output_json.replace(".json", "")
+                safe_pair_name = comparison_name.replace("/", "_").replace("\\", "_")
+                pair_output = f"{base_name}_{safe_pair_name}.json"
+                with open(pair_output, "w") as f:
+                    json.dump(
+                        pair_results, f, indent=2, default=lambda x: float(x) if isinstance(x, np.floating) else x
+                    )
+                print(f"\nPer-pair results saved to: {pair_output}")
+
+    return all_results
+
+
+def run_independent_comparison(
+    df: pd.DataFrame, model_pairs: list[str], has_sample_id: bool, score_col: str, args: Any
+) -> dict[str, dict]:
+    """
+    Run independent comparison: analyze each model_pair separately.
+
+    Args:
+        df: Full dataframe with all models
+        model_pairs: List of model_pair identifiers to analyze
+        has_sample_id: Whether sample_id column exists
+        score_col: Name of score column
+        args: Command-line arguments
+
+    Returns:
+        Dictionary mapping model_pair names to results
+    """
+    all_results = {}
+
+    # Check for difficulty/actual_correct columns
+    has_difficulty = "difficulty" in df.columns
+    has_actual_correct = "actual_correct" in df.columns
+
+    print("Independent comparison mode: Analyzing each model_pair separately\n")
+    print("⚠ Warning: Each model may contain only one class (sandbagging or normal)")
+    print("  This mode is mainly for exploratory analysis\n")
+
+    for model_pair in model_pairs:
+        print(f"\n{'=' * 70}")
+        print(f"MODEL PAIR: {model_pair}")
+        print(f"{'=' * 70}\n")
+
+        pair_df = df[df["model_pair"] == model_pair].copy()
+
+        # Extract samples and labels
+        samples = pair_df[score_col].values
+        labels = pair_df["ground_truth_label"].values
+        groups = pair_df["sample_id"].values if has_sample_id else None
+        difficulty = pair_df["difficulty"].values if has_difficulty else None
+        actual_correct = pair_df["actual_correct"].values if has_actual_correct else None
+
+        # Check if only one class present
+        unique_labels = np.unique(labels)
+        if len(unique_labels) == 1:
+            print(f"⚠ Warning: Only one class found (label={unique_labels[0]})")
+            print("  Binary classification metrics may not be meaningful\n")
+
+        # Run analysis for this model pair
+        if args.compare_aggregations:
+            pair_results = run_aggregation_comparison(
+                samples, labels, groups, args, score_col, model_pair,
+                difficulty=difficulty, actual_correct=actual_correct
+            )
+        else:
+            pair_results = run_analysis(
+                samples, labels, groups, args, score_col, model_pair,
+                difficulty=difficulty, actual_correct=actual_correct
+            )
+        all_results[model_pair] = pair_results
+
+        # Save per-pair results
+        if args.output_json:
+            base_name = args.output_json.replace(".json", "")
+            safe_pair_name = model_pair.replace("/", "_").replace("\\", "_")
+            pair_output = f"{base_name}_{safe_pair_name}.json"
+            with open(pair_output, "w") as f:
+                json.dump(pair_results, f, indent=2, default=lambda x: float(x) if isinstance(x, np.floating) else x)
+            print(f"\nPer-pair results saved to: {pair_output}")
+
+    return all_results
+
+
+class Args:
+    """Compatibility class to hold parsed arguments from Hydra config."""
+
+    pass
+
+
+@hydra.main(
+    version_base=None,
+    config_path="../configs",
+    config_name="classifier/bootstrap_cv",
+)
+def main(cfg: DictConfig) -> None:
+    """Run multi-sample bootstrap CV classifier.
+
+    Args:
+        cfg: Hydra configuration (populated from YAML + CLI overrides)
+    """
+    # Resolve all interpolations and validate required parameters
+    OmegaConf.resolve(cfg)
+
+    # Extract config values (all under classifier package)
+    c = cfg.classifier  # Shorthand for classifier config
+    input_csv = c.get("input_csv", None)
+    dev_csv = c.get("dev_csv", None)
+    test_csv = c.get("test_csv", None)
+    k_samples = c.k_samples
+    aggregation = c.aggregation
+    compare_mode = c.compare_mode
+    score_column = c.score_column
+    normal_model = c.normal_model
+    n_iterations = c.n_iterations
+    min_samples_for_bootstrap = c.min_samples_for_bootstrap
+    allow_k_greater_than_n = c.allow_k_greater_than_n
+    warn_on_small_n = c.warn_on_small_n
+    n_jobs = c.n_jobs
+    output_json = c.output_json
+    target_fpr = c.target_fpr
+    cv_folds = c.cv.folds
+    cv_stratified = c.cv.stratified
+    cv_conservative = c.cv.conservative
+    seed = c.seed
+
+    # Paraphrase pre-aggregation settings (for TM max-suspicion)
+    aggregate_paraphrases_first = getattr(c, "aggregate_paraphrases_first", False)
+    paraphrase_aggregation = getattr(c, "paraphrase_aggregation", "max")
+
+    # Full pipeline bootstrap mode selection
+    # Default False: fixed threshold from dev, bootstrap variance on test (recommended)
+    # True: per-iteration threshold, captures threshold selection variance too
+    full_pipeline_bootstrap = getattr(c, "full_pipeline_bootstrap", False)
+
+    # Parse aggregation argument
+    if aggregation == "all":
+        # "all" only includes standard aggregations (not correlation-based)
+        aggregations = list(AVAILABLE_AGGREGATIONS)
+        print(f"Using all {len(aggregations)} standard aggregation statistics")
+    elif "," in str(aggregation):
+        aggregations = [agg.strip() for agg in str(aggregation).split(",")]
+        # Validate each aggregation (accepts both standard and correlation aggregations)
+        invalid = [agg for agg in aggregations if agg not in ALL_AGGREGATIONS]
+        if invalid:
+            raise ValueError(
+                f"Invalid aggregation(s): {', '.join(invalid)}. "
+                f"Available standard: {', '.join(AVAILABLE_AGGREGATIONS)}. "
+                f"Available correlation: {', '.join(CORRELATION_AGGREGATIONS)}"
+            )
+        print(f"Using {len(aggregations)} aggregation statistics: {', '.join(aggregations)}")
+    else:
+        aggregations = [str(aggregation)]
+        if aggregation not in ALL_AGGREGATIONS:
+            raise ValueError(
+                f"Invalid aggregation: {aggregation}. "
+                f"Available standard: {', '.join(AVAILABLE_AGGREGATIONS)}. "
+                f"Available correlation: {', '.join(CORRELATION_AGGREGATIONS)}"
+            )
+
+    compare_aggregations = len(aggregations) > 1
+
+    # Output filename will be auto-generated later after mode detection (split vs single)
+    # to avoid errors when input_csv is None in split mode
+
+    # Validate arguments
+    if normal_model and compare_mode != "paired":
+        print(f"Warning: normal_model specified but compare_mode is '{compare_mode}'")
+        print("  normal_model is only used in 'paired' mode and will be ignored")
+        print()
+
+    # Build args object for compatibility with existing functions
+    args = Args()
+    args.input_csv = input_csv
+    args.k_samples = k_samples
+    args.n_iterations = n_iterations
+    args.aggregation = aggregation
+    args.aggregations = aggregations
+    args.compare_aggregations = compare_aggregations
+    args.target_fpr = target_fpr
+    args.cv_folds = cv_folds
+    args.cv_stratified = cv_stratified
+    args.cv_conservative = cv_conservative
+    args.seed = seed
+    args.allow_k_greater_than_n = allow_k_greater_than_n
+    args.warn_on_small_n = warn_on_small_n
+    args.min_samples_for_bootstrap = min_samples_for_bootstrap
+    args.output_json = output_json
+    args.score_column = score_column
+    args.compare_mode = compare_mode
+    args.normal_model = normal_model
+    args.n_jobs = n_jobs
+    args.full_pipeline_bootstrap = full_pipeline_bootstrap
+
+    # Determine mode: split (dev_csv + test_csv) or single (input_csv)
+    split_mode = dev_csv is not None and test_csv is not None
+    single_mode = input_csv is not None
+
+    if split_mode and single_mode:
+        print("⚠ Warning: Both input_csv and dev_csv/test_csv provided. Using split mode.")
+        single_mode = False
+
+    if not split_mode and not single_mode:
+        raise ValueError(
+            "Must provide either 'input_csv' for k-fold CV mode, "
+            "or both 'dev_csv' and 'test_csv' for split mode."
+        )
+
+    # Handle split mode (dev→test threshold transfer)
+    if split_mode:
+        print("=" * 70)
+        print("SPLIT MODE: Threshold on dev, evaluate on test")
+        print("=" * 70)
+        print(f"  Dev CSV: {dev_csv}")
+        print(f"  Test CSV: {test_csv}")
+        print()
+
+        dev_df = pd.read_csv(dev_csv)
+        test_df = pd.read_csv(test_csv)
+
+        # Auto-detect score column
+        score_col = score_column
+        if not score_col:
+            for col in ["entropy_score", "sandbagging_score", "probe_score", "tm_score", "score"]:
+                if col in dev_df.columns:
+                    score_col = col
+                    break
+            if score_col is None:
+                raise ValueError(
+                    f"No recognized score column found. Available columns: {dev_df.columns.tolist()}"
+                )
+        print(f"Using score column: '{score_col}'")
+
+        # Validate score column exists in both CSVs
+        if score_col not in dev_df.columns:
+            raise ValueError(f"Score column '{score_col}' not found in dev CSV.")
+        if score_col not in test_df.columns:
+            raise ValueError(f"Score column '{score_col}' not found in test CSV.")
+
+        # Check for difficulty/actual_correct columns
+        has_difficulty = "difficulty" in dev_df.columns and "difficulty" in test_df.columns
+        has_actual_correct = "actual_correct" in dev_df.columns and "actual_correct" in test_df.columns
+
+        # Extract dev samples
+        dev_samples = dev_df[score_col].values
+        dev_labels = dev_df["ground_truth_label"].values
+        dev_difficulty = dev_df["difficulty"].values if has_difficulty else None
+        dev_actual_correct = dev_df["actual_correct"].values if has_actual_correct else None
+
+        # Extract test samples
+        test_samples = test_df[score_col].values
+        test_labels = test_df["ground_truth_label"].values
+        test_difficulty = test_df["difficulty"].values if has_difficulty else None
+        test_actual_correct = test_df["actual_correct"].values if has_actual_correct else None
+
+        # Run split-based analysis
+        results = run_split_analysis(
+            dev_samples,
+            dev_labels,
+            test_samples,
+            test_labels,
+            args,
+            score_col,
+            dev_difficulty=dev_difficulty,
+            dev_actual_correct=dev_actual_correct,
+            test_difficulty=test_difficulty,
+            test_actual_correct=test_actual_correct,
+        )
+
+        # Handle auto-generated output filename for split mode
+        if output_json == "auto" or output_json is None:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:19]
+            dev_stem = Path(dev_csv).stem
+            agg_str = aggregations[0] if len(aggregations) == 1 else f"{len(aggregations)}aggs"
+            json_filename = f"{dev_stem}_split_{agg_str}_k{k_samples}_{timestamp}.json"
+            output_json = str(Path("out") / json_filename)
+            print(f"Auto-generated output path: {output_json}")
+
+        # Save results (validated via DetectionReport)
+        report = None
+        if output_json:
+            report = _write_report_json(results, output_json)
+            print(f"\nResults saved to: {output_json}")
+
+        return report if report is not None else results
+
+    # Load data (single CSV / k-fold mode)
+    df = pd.read_csv(input_csv)
+
+    # Handle auto-generated output filename for single mode
+    if output_json == "auto" or output_json is None:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:19]
+        input_stem = Path(input_csv).stem
+        agg_str = aggregations[0] if len(aggregations) == 1 else f"{len(aggregations)}aggs"
+        mode_str = compare_mode.replace("-", "_")
+        json_filename = f"{input_stem}_{mode_str}_{agg_str}_k{k_samples}_{timestamp}.json"
+        output_json = str(Path("out") / json_filename)
+        # Update args with the auto-generated filename
+        args.output_json = output_json
+        print(f"Auto-generated output path: {output_json}")
+
+    # Ensure output directory exists
+    if output_json:
+        output_path = Path(output_json)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Issue #1 FIX: Auto-detect score column name
+    if score_column:
+        score_col = score_column
+        if score_col not in df.columns:
+            raise ValueError(f"Score column '{score_col}' not found. Available columns: {df.columns.tolist()}")
+    else:
+        # Auto-detect
+        score_col = None
+        for col in ["entropy_score", "sandbagging_score", "probe_score", "tm_score", "score"]:
+            if col in df.columns:
+                score_col = col
+                break
+        if score_col is None:
+            raise ValueError(
+                f"No recognized score column found. Available columns: {df.columns.tolist()}. "
+                f"Use classifier.score_column to specify."
+            )
+
+    print(f"Using score column: '{score_col}'")
+
+    # Issue #2 FIX: Check for sample_id column (prevents paraphrase leakage)
+    has_sample_id = "sample_id" in df.columns
+    has_model_pair = "model_pair" in df.columns
+
+    if has_sample_id:
+        print("✓ Found 'sample_id' column - will use GroupKFold to prevent data leakage")
+        print("  (keeps all variants of same sample together in CV splits)")
+        print(f"  Total rows: {len(df)}, Unique samples: {df['sample_id'].nunique()}")
+    else:
+        print("⚠ No 'sample_id' column - using row-level splitting")
+        print("  (if CSV has multiple rows per sample, this may cause data leakage)")
+
+    # Pre-aggregate paraphrases if enabled (e.g., max suspicion for TM)
+    if aggregate_paraphrases_first and has_sample_id:
+        print(f"\n{'=' * 70}")
+        print(f"PRE-AGGREGATING PARAPHRASES: {paraphrase_aggregation}")
+        print(f"{'=' * 70}")
+
+        # Get stats before aggregation
+        stats_before = get_aggregation_stats(df, sample_id_col="sample_id")
+        print(f"  Before: {stats_before['n_total_rows']} rows, "
+              f"{stats_before['n_base_questions']} base questions")
+        print(f"  Avg paraphrases/question: {stats_before['avg_paraphrases_per_question']:.1f}")
+        if stats_before['strategies_found']:
+            print(f"  Strategies found: {sorted(stats_before['strategies_found'])}")
+
+        # Perform aggregation
+        df = aggregate_paraphrase_scores(
+            df,
+            aggregation=paraphrase_aggregation,
+            sample_id_col="sample_id",
+            score_col=score_col,
+            preserve_columns=["model_pair", "ground_truth_label", "is_sandbagging", "label"],
+        )
+
+        print(f"  After: {len(df)} rows (one per base question)")
+        print(f"  Aggregation: {paraphrase_aggregation}")
+        print()
+    elif aggregate_paraphrases_first and not has_sample_id:
+        print("\n⚠ Warning: aggregate_paraphrases_first=true but no 'sample_id' column found")
+        print("  Skipping paraphrase aggregation\n")
+
+    # Check for difficulty/actual_correct columns (required for spearman_difficulty)
+    has_difficulty = "difficulty" in df.columns
+    has_actual_correct = "actual_correct" in df.columns
+
+    # Validate spearman_difficulty requirements
+    uses_spearman = any(agg in CORRELATION_AGGREGATIONS for agg in aggregations)
+    if uses_spearman:
+        if not has_difficulty or not has_actual_correct:
+            missing = []
+            if not has_difficulty:
+                missing.append("difficulty")
+            if not has_actual_correct:
+                missing.append("actual_correct")
+            raise ValueError(
+                f"Aggregation 'spearman_difficulty' requires columns: {', '.join(missing)}\n"
+                f"Available columns: {df.columns.tolist()}\n"
+                f"Generate these columns using run_difficulty_correlation with --output-csv"
+            )
+        print("✓ Found 'difficulty' and 'actual_correct' columns for correlation aggregations")
+
+    # Process based on model_pair column and comparison mode
+    if not has_model_pair:
+        # Single model pair analysis (legacy mode)
+        if args.compare_mode != "independent":
+            print(f"\n⚠ Warning: No 'model_pair' column found, ignoring --compare-mode={args.compare_mode}")
+            print("  Falling back to single dataset analysis\n")
+
+        print()
+        samples = df[score_col].values
+        labels = df["ground_truth_label"].values
+        groups = df["sample_id"].values if has_sample_id else None
+        difficulty = df["difficulty"].values if has_difficulty else None
+        actual_correct = df["actual_correct"].values if has_actual_correct else None
+
+        # Use aggregation comparison if multiple aggregations specified
+        if args.compare_aggregations:
+            results = run_aggregation_comparison(
+                samples, labels, groups, args, score_col,
+                difficulty=difficulty, actual_correct=actual_correct
+            )
+        else:
+            results = run_analysis(
+                samples, labels, groups, args, score_col,
+                difficulty=difficulty, actual_correct=actual_correct
+            )
+
+        report = None
+        if args.output_json:
+            report = _write_report_json(results, args.output_json)
+            print(f"\nResults saved to: {args.output_json}")
+
+        return report if report is not None else results
+
+    # Multi model-pair analysis
+    all_model_pairs = sorted(df["model_pair"].unique())
+    # Handle both prefix (sandbagger_*, normal_*) and suffix (*_sandbag, *_normal) patterns
+    sandbagging_pairs = [p for p in all_model_pairs if "_sandbag" in p or p.startswith("sandbagger_")]
+    normal_pairs = [p for p in all_model_pairs if "_normal" in p or p.startswith("normal_")]
+
+    print(f"\n✓ Found 'model_pair' column with {len(all_model_pairs)} unique model_pairs")
+    print(f"  Sandbagging models: {len(sandbagging_pairs)}")
+    for pair in sandbagging_pairs:
+        count = len(df[df["model_pair"] == pair])
+        unique_samples = df[df["model_pair"] == pair]["sample_id"].nunique() if has_sample_id else count
+        print(f"    - {pair}: {count} rows" + (f" ({unique_samples} unique samples)" if has_sample_id else ""))
+    print(f"  Normal models: {len(normal_pairs)}")
+    for pair in normal_pairs:
+        count = len(df[df["model_pair"] == pair])
+        unique_samples = df[df["model_pair"] == pair]["sample_id"].nunique() if has_sample_id else count
+        print(f"    - {pair}: {count} rows" + (f" ({unique_samples} unique samples)" if has_sample_id else ""))
+    print()
+
+    # Dispatch based on comparison mode
+    if args.compare_mode == "independent":
+        # Independent mode: analyze each model separately
+        all_results = run_independent_comparison(df, all_model_pairs, has_sample_id, score_col, args)
+
+    elif len(normal_pairs) == 0:
+        # No normal models found - force independent mode
+        print("⚠ Warning: No normal models found (no model_pair with '_normal')")
+        print(f"  Ignoring --compare-mode={args.compare_mode}, using 'independent' mode instead")
+        print("  Each model_pair will be analyzed independently (may fail if only one class)\n")
+        all_results = run_independent_comparison(df, all_model_pairs, has_sample_id, score_col, args)
+
+    elif args.compare_mode == "paired":
+        # Paired mode: each sandbagging vs specified normal
+        if args.normal_model:
+            if args.normal_model not in normal_pairs:
+                raise ValueError(
+                    f"Specified --normal-model '{args.normal_model}' not found in normal models.\n"
+                    f"Available normal models: {normal_pairs}"
+                )
+            normal_model = args.normal_model
+        else:
+            normal_model = normal_pairs[0]
+            if len(normal_pairs) > 1:
+                print(f"⚠ Multiple normal models found ({len(normal_pairs)})")
+                print(f"  Using first: {normal_model}")
+                print("  Use --normal-model to specify a different one\n")
+
+        all_results = run_paired_comparison(df, sandbagging_pairs, normal_model, has_sample_id, score_col, args)
+
+    elif args.compare_mode == "pooled":
+        # Pooled mode: all sandbagging vs all normal combined
+        all_results = run_pooled_comparison(df, sandbagging_pairs, normal_pairs, has_sample_id, score_col, args)
+
+    elif args.compare_mode == "all-pairs":
+        # All-pairs mode: every sandbagging vs every normal
+        all_results = run_all_pairs_comparison(df, sandbagging_pairs, normal_pairs, has_sample_id, score_col, args)
+
+    else:
+        raise ValueError(f"Unknown compare_mode: {args.compare_mode}")
+
+    # Save combined results (except for pooled mode which saves directly)
+    report = None
+    if args.output_json and args.compare_mode != "pooled":
+        report = _write_report_json(all_results, args.output_json)
+        print(f"\n{'=' * 70}")
+        print(f"Combined results saved to: {args.output_json}")
+        print(f"{'=' * 70}")
+
+    return report if report is not None else all_results
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,22 @@
+# @package _global_
+defaults:
+  - conf
+  - mixins/lie-detector
+  - usaco-selected
+  - override dataset: usaco-train-val
+  - _self_
+
+# Dataset overrides for lie detector
+sweep:
+  dataset_overrides:
+    usaco:
+      sandbox: null  # No sandbox needed without scoring
+
+# Disable scoring (use Inspect's native no-score functionality)
+trajectory:
+  eval:
+    score: false
+
+# Logging override for this sweep
+logs:
+  dir: usaco-lie-detector-${now:%Y-%m-%d_%H-%M-%S}

@@ -1,0 +1,6 @@
+# @package _global_
+# GSM8K dataset variant using dev split
+defaults:
+  - gsm8k
+
+custom_split: dev

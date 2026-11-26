@@ -1,0 +1,16 @@
+# @package _global_
+defaults:
+  - conf
+  - mixins/lie-detector
+  - gpqa-selected
+  - _self_
+
+# Force dev split (78 samples)
+sweep:
+  dataset_overrides:
+    gpqa:
+      custom_split: dev
+
+# Logging override for this sweep
+logs:
+  dir: gpqa-lie-detector-${now:%Y-%m-%d_%H-%M-%S}

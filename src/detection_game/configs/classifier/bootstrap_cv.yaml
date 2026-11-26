@@ -1,0 +1,82 @@
+# Bootstrap CV classifier configuration
+#
+# Usage:
+#   python -m src.detection_game.classifiers.run_multisample_bootstrap_cv \
+#     classifier.input_csv=out/scores.csv \
+#     classifier.k_samples=5 \
+#     classifier.aggregation=mean \
+#     classifier.compare_mode=all-pairs
+#
+# All parameters without defaults (marked ???) are REQUIRED.
+
+defaults:
+  - base
+  - _self_
+
+# Input options (choose ONE mode):
+#
+# Mode 1: Single CSV with k-fold CV
+#   input_csv: out/scores.csv
+#
+# Mode 2: Separate dev/test CSVs (threshold on dev, evaluate on test)
+#   dev_csv: out/scores_dev.csv
+#   test_csv: out/scores_test.csv
+
+# Single CSV mode (original k-fold CV)
+input_csv: null
+
+# Split mode (dev→test threshold transfer)
+dev_csv: null
+test_csv: null
+
+# REQUIRED: Number of samples per bootstrap iteration
+# Report k=1, k=5 and k=10
+k_samples: ???
+
+# REQUIRED: Aggregation method(s)
+# Standard: mean, median, std, mad, skewness, kurtosis, p10, p25, p90, p90_over_p10, iqr, max, min, cv, range, trimmed_mean, winsorized_mean, mean_pairwise_abs_diff
+# Correlation-based (requires difficulty + actual_correct columns; recommend k>=10):
+#   - spearman_difficulty: Spearman rank correlation between difficulty and correctness
+#   - kendall_difficulty: Kendall's tau (more robust to ties, better for small samples)
+# Multiple: mean,median,std (comma-separated)
+# All: "all" for all 18 standard statistics (excludes correlation)
+aggregation: ???
+
+# REQUIRED: Comparison mode
+# all-pairs: Every sandbagging vs every normal (comprehensive)
+# paired: Each sandbagging model vs specified normal model
+# pooled: All sandbagging vs all normal combined
+# independent: Each model_pair analyzed separately
+compare_mode: ???
+
+# Optional: Score column name (auto-detected if not specified)
+score_column: null
+
+# Optional: Specific normal model for paired mode
+normal_model: null
+
+# Bootstrap settings (fixed)
+n_iterations: 1000
+min_samples_for_bootstrap: 10
+allow_k_greater_than_n: false
+warn_on_small_n: false
+
+# Full pipeline bootstrap mode selection
+# When False (default, recommended): Compute single robust threshold from ALL dev samples,
+#   then evaluate n_iterations bootstrap samples from test, reporting mean ± SEM.
+#   This gives stable threshold + proper bootstrap variance on detection rate.
+# When True: For each iteration, resample k from dev → compute threshold → resample k from test → evaluate.
+#   This captures FULL variance including threshold selection variance, but threshold is less stable.
+full_pipeline_bootstrap: false
+
+# Paraphrase pre-aggregation (for TM max-suspicion across paraphrases)
+# When enabled, groups rows by base question ID and aggregates scores BEFORE bootstrap sampling.
+# This implements "max suspicion = max(tm_score_1, ..., tm_score_k)" across paraphrases.
+aggregate_paraphrases_first: false
+paraphrase_aggregation: max  # max | mean | min | median
+
+# Parallelization
+n_jobs: -1  # -1 = all CPU cores
+
+# Output settings (override from base)
+output_json: auto  # "auto" for auto-generated filename

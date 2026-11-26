@@ -1,0 +1,32 @@
+# @package _global_
+defaults:
+  - conf
+  - override model@models.normal: gpt4.1-mini
+  # Don't include a sandbagger model default
+  - _self_
+
+sweep:
+  datasets: [math, gpqa]
+  mode: cartesian
+
+  # Multiple normal models
+  role_models:
+    normal: [gpt4.1-mini, gpt5-nano]
+
+  # Eval settings
+  model_sweep:
+    temperature: [1.0]
+
+# Override trajectory settings
+trajectory:
+  model:
+    normal: ${models.normal}
+    sandbagger: null  # Disable sandbagger
+  eval:
+    max_connections: 10
+    max_tasks: 1
+    limit: 100
+    epochs: 1
+
+logs:
+  dir: benign_only_sweep_${now:%Y-%m-%d_%H-%M-%S}

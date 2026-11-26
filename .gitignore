@@ -1,0 +1,62 @@
+# Python
+*.egg-info
+.ruff_cache
+.pytest_cache
+.ipynb_checkpoints
+__pycache__
+*.ipyc
+.conda
+.venv
+
+# Mac
+.DS_Store
+
+# wandb
+wandb
+
+# IDE
+.idea/
+.vscode/
+.env
+__pycache__/
+SECRETS.test
+
+# Inspect
+*.eval
+logs.json
+/logs
+charts/
+.compose.yaml
+
+
+# Hydra
+outputs/
+multirun/
+.hydra
+
+*.log
+.*cache/
+archive/
+*archive/
+archive*/
+
+*.pkl
+
+tmp/
+
+archive/
+/tmp
+# /data
+/experiments
+/results
+/logs
+/out
+/output
+/outputs
+*.err
+
+
+
+*.db
+.envrc
+!src/detection_game/utils/lie_detectors/models/*.pkl

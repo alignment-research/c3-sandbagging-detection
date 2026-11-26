@@ -1,0 +1,6 @@
+# @package _global_
+# USACO dataset variant using dev split (122 samples)
+defaults:
+  - usaco
+
+custom_split: dev

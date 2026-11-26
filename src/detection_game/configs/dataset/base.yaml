@@ -1,0 +1,33 @@
+# Base dataset configuration with common parameters
+# Other dataset configs inherit from this to avoid duplication
+
+# Convert OmegaConf types to Python primitives for all configs
+_convert_: "all"
+
+# Dataset identifier (should be overridden by specific dataset configs)
+name: ???  # REQUIRED: Must be overridden (e.g., "gpqa", "math", "usaco")
+
+# Custom splitting parameters
+# After loading HF split, divide into dev/test (paper terminology)
+# dev: Development set for hyperparameter tuning (40%)
+# test: Held-out set for final evaluation (60%)
+dev_ratio: 0.4         # Must be non-negative and sum to 1.0
+test_ratio: 0.6
+split_seed: 42
+
+# Few-shot parameters (can be overridden by dataset-specific configs)
+fewshot: 0          # Number of few-shot examples (0 = zero-shot)
+fewshot_seed: 42    # Seed for few-shot example selection
+
+# Cache configuration (uses defaults from cache config group)
+cache: ${cache.enabled}
+cache_expiry: ${cache.expiry}
+
+# Sampling parameters (can be overridden by dataset-specific configs)
+# These will be used for model inference on this dataset
+sampling_params:
+  temperature: 0.3  # Default temperature
+  top_p: 1.0       # Default nucleus sampling
+  top_k: null      # Default top-k sampling (null = disabled)
+  seed: 42         # Default sampling seed
+  log_probs: true  # Whether to return log probabilities

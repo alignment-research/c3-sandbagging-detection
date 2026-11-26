@@ -1,0 +1,21 @@
+# @package _global_
+defaults:
+  - conf
+  - gpqa-selected
+  - override dataset: gpqa-train-val
+  - override paraphraser: static_gpqa
+  - _self_
+
+# Sweep configuration for GPQA paraphrasing
+sweep:
+  # Optional prompt template sweep
+  explanation_prompts: [
+    "Provide a {num_sentences} sentence explanation for your answer so that a university student can understand it.",
+  ]
+
+  # Optional num_sentences list
+  num_sentences: [5]
+
+# Logging override for this sweep
+logs:
+  dir: gpqa-paraphrase-${hydra:runtime.choices.paraphraser}-${now:%Y-%m-%d_%H-%M-%S}

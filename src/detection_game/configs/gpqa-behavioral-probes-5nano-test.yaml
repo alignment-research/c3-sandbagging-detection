@@ -1,0 +1,56 @@
+# @package _global_
+# GPQA Behavioral Probes - gpt-5-nano on TEST Set
+# TEST set: 119 samples for final evaluation
+defaults:
+  - conf
+  - mixins/behavioral_probes
+  - override dataset: gpqa-train-val
+  - override model@models.normal: gpt5-nano
+  - override model@models.sandbagger: gpt5-nano
+  - _self_
+
+# Disable paraphrasing for behavioral probes
+paraphraser:
+  activate: false
+
+# Sweep: 10 validated prompts for gpt-5-nano
+sweep:
+  datasets: [gpqa]
+  mode: cartesian
+
+  # Model parameters
+  model_sweep:
+    temperature: [1.0]
+
+  # 10 validated sandbagging prompts (from prompt selection for 5-nano)
+  role_system_prompts:
+    sandbagger:
+      - aggressive/zero_accuracy_explicit
+      - context_manipulation/designed_to_trick
+      - deterministic_errors/correct_reasoning_wrong_extraction
+      - deterministic_errors/off_by_one
+      - paper/target_perf/sandbag_0
+      - paper/target_perf/sandbag_20
+      - paper/target_perf/sandbag_5
+      - persona/second_guesser
+      - persona/time_pressured
+      - random/random_noise_generator
+
+  # Dataset overrides - TEST SPLIT
+  dataset_overrides:
+    gpqa:
+      custom_split: test  # CRITICAL: test set (119 samples)
+
+# Trajectory settings
+trajectory:
+  eval:
+    epochs: 5
+    limit: null  # Full test set (119 samples)
+    max_connections: 100
+    max_tasks: 1
+    score: false
+    cache: true
+
+# Logging
+logs:
+  dir: gpqa-behavioral-probes-5nano-test-${now:%Y%m%d_%H%M%S}

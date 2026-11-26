@@ -1,0 +1,6 @@
+# Static paraphraser for GPQA dataset
+defaults:
+  - static
+
+# Use all available strategies from disk (v3.2 + v4 = ~54 total)
+strategies: all

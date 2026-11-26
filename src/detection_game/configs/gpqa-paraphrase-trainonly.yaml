@@ -1,0 +1,25 @@
+# @package _global_
+defaults:
+  - conf
+  - gpqa-selected
+  - override paraphraser: static_gpqa
+  - _self_
+
+# Override to use dev split
+trajectory:
+  dataset:
+    custom_split: dev
+
+# Sweep configuration for GPQA
+sweep:
+  # Optional prompt template sweep
+  explanation_prompts: [
+    "Provide a {num_sentences} sentence explanation for your answer so that a university student can understand it.",
+  ]
+
+  # Optional num_sentences list
+  num_sentences: [5]
+
+# Logging override for this sweep
+logs:
+  dir: gpqa-paraphrase-trainonly-${hydra:runtime.choices.paraphraser}-${now:%Y-%m-%d_%H-%M-%S}
